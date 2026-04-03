@@ -1,0 +1,8 @@
+{
+  "root_gateway": "IP_VYOS_1",
+  "gateways": [
+    {"id": "P1", "ip": "IP_VYOS_1", "costs": {"P2": 2, "P3": 4}},
+    {"id": "P2", "ip": "IP_VYOS_2", "costs": {"P1": 2, "P3": 1}},
+    {"id": "P3", "ip": "IP_VYOS_3", "costs": {"P1": 4, "P2": 1}}
+  ]
+}
