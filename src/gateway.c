@@ -11,26 +11,24 @@
 #define BUFFER_SIZE 2048
 #define MAX_NODES 10
 
-// Structure pour stocker la connaissance locale (issue du JSON)
 typedef struct {
-    char id[10];
     char ip[16];
-    int cost_to_neighbor; // Coût de MOI vers ce voisin (lu dans le JSON)
+    int cost_to_me; // Coût réseau direct lu dans le JSON
 } NeighborConfig;
 
-// État global de la passerelle
+// État de la passerelle
 char my_ip[16];
 char root_ip[16];
 int is_root = 0;
-int my_dist_to_root = 999; // Infini au départ, 0 si PR
+int dist_to_root = 999; // Ma distance actuelle à la racine via l'arbre
 
 NeighborConfig topology[MAX_NODES];
 int topology_count = 0;
 
-// Listes de l'arbre de niveau 2
-char tree_members[MAX_NODES][16]; // IPs des passerelles à qui je dois renvoyer le flux
-int tree_member_count = 0;
-char local_receivers[MAX_NODES][16]; // IPs des terminaux Microcore connectés ici
+// Listes de l'arbre (Niveau 2)
+char tree_neighbors[MAX_NODES][16]; // Qui je dois arroser (enfants/voisins)
+int tree_neighbor_count = 0;
+char local_receivers[MAX_NODES][16]; // Terminaux Microcore locaux
 int receiver_count = 0;
 
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -38,7 +36,7 @@ pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 // --- CHARGEMENT DU JSON ---
 void load_config(const char *filename) {
     FILE *f = fopen(filename, "rb");
-    if (!f) { perror("Erreur fichier JSON"); exit(1); }
+    if (!f) exit(1);
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -48,10 +46,7 @@ void load_config(const char *filename) {
 
     cJSON *json = cJSON_Parse(data);
     strcpy(root_ip, cJSON_GetObjectItem(json, "root_gateway")->valuestring);
-    if (strcmp(my_ip, root_ip) == 0) {
-        is_root = 1;
-        my_dist_to_root = 0;
-    }
+    if (strcmp(my_ip, root_ip) == 0) { is_root = 1; dist_to_root = 0; }
 
     cJSON *gateways = cJSON_GetObjectItem(json, "gateways");
     int size = cJSON_GetArraySize(gateways);
@@ -60,7 +55,7 @@ void load_config(const char *filename) {
         const char* ip = cJSON_GetObjectItem(item, "ip")->valuestring;
         if (strcmp(ip, my_ip) != 0) {
             strcpy(topology[topology_count].ip, ip);
-            topology[topology_count].cost_to_neighbor = cJSON_GetObjectItem(item, "cost")->valueint;
+            topology[topology_count].cost_to_me = cJSON_GetObjectItem(item, "cost")->valueint;
             topology_count++;
         }
     }
@@ -68,18 +63,7 @@ void load_config(const char *filename) {
     cJSON_Delete(json);
 }
 
-// --- LOGIQUE DE DUPLICATION (NIVEAU 2) ---
-void add_to_tree(char *ip) {
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < tree_member_count; i++) {
-        if (strcmp(tree_members[i], ip) == 0) { pthread_mutex_unlock(&lock); return; }
-    }
-    strcpy(tree_members[tree_member_count++], ip);
-    printf("[ARBRE] %s ajouté à la liste de diffusion\n", ip);
-    pthread_mutex_unlock(&lock);
-}
-
-// --- THREAD DE CONTRÔLE (SIGNALISATION PORT 5000) ---
+// --- PLAN DE CONTRÔLE (SIGNALISATION) ---
 void* control_thread(void* arg) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(CONTROL_PORT), .sin_addr.s_addr = INADDR_ANY };
@@ -94,46 +78,50 @@ void* control_thread(void* arg) {
         buffer[n] = '\0';
         char *sender_ip = inet_ntoa(sender_addr.sin_addr);
 
-        // 1. Un Microcore fait un JOIN
+        // 1. Reception d'un JOIN (Microcore) -> C lance l'enquête
         if (strcmp(buffer, "JOIN") == 0) {
-            printf("[CTRL] JOIN reçu du terminal %s\n", sender_ip);
             strcpy(local_receivers[receiver_count++], sender_ip);
-
-            // Lancer le calcul du meilleur parent (JACK)
-            // On interroge les autres passerelles pour connaître leur coût
+            // C demande à TOUTES les passerelles du JSON leur distance actuelle à l'arbre
             for (int i = 0; i < topology_count; i++) {
                 struct sockaddr_in dest = { .sin_family = AF_INET, .sin_port = htons(CONTROL_PORT) };
                 inet_pton(AF_INET, topology[i].ip, &dest.sin_addr);
-                sendto(sock, "GET_COST", 8, 0, (struct sockaddr *)&dest, sizeof(dest));
+                sendto(sock, "GET_TREE_DIST", 13, 0, (struct sockaddr *)&dest, sizeof(dest));
             }
         }
-        // 2. Quelqu'un demande mon coût vers la racine
-        else if (strcmp(buffer, "GET_COST") == 0) {
-            char reply[32];
-            sprintf(reply, "MY_COST %d", my_dist_to_root);
-            sendto(sock, reply, strlen(reply), 0, (struct sockaddr *)&sender_addr, addr_len);
-        }
-        // 3. Réception d'une réponse de coût pour calcul JACK
-        else if (strncmp(buffer, "MY_COST", 7) == 0) {
-            int remote_cost = atoi(buffer + 8);
-            int local_link_cost = 0;
-            for(int i=0; i<topology_count; i++) if(strcmp(topology[i].ip, sender_ip) == 0) local_link_cost = topology[i].cost_to_neighbor;
-
-            int total_path = remote_cost + local_link_cost;
-            printf("[JACK] Chemin via %s : coût total %d\n", sender_ip, total_path);
-
-            if (total_path < 100) { // Condition simplifiée pour l'exemple : si chemin valide
-                 sendto(sock, "JACK", 4, 0, (struct sockaddr *)&sender_addr, addr_len);
+        // 2. Une passerelle (A ou B) répond à la requête de distance
+        else if (strcmp(buffer, "GET_TREE_DIST") == 0) {
+            // On ne répond QUE si on fait déjà partie de l'arbre (ou si on est Root)
+            if (dist_to_root < 999) {
+                char reply[32];
+                sprintf(reply, "TREE_DIST %d", dist_to_root);
+                sendto(sock, reply, strlen(reply), 0, (struct sockaddr *)&sender_addr, addr_len);
             }
         }
-        // 4. Une passerelle m'a choisi comme parent
+        // 3. C reçoit les distances et calcule le meilleur coût (JACK)
+        else if (strncmp(buffer, "TREE_DIST", 9) == 0) {
+            int dist_annoncee = atoi(buffer + 10);
+            int cout_vers_lui = 0;
+            for(int i=0; i<topology_count; i++) if(strcmp(topology[i].ip, sender_ip) == 0) cout_vers_lui = topology[i].cost_to_me;
+
+            int cout_total = dist_annoncee + cout_vers_lui;
+
+            // Si ce chemin est meilleur que mon chemin actuel
+            if (cout_total < dist_to_root) {
+                dist_to_root = cout_total;
+                // On envoie le JACK au nouveau "meilleur parent"
+                sendto(sock, "JACK", 4, 0, (struct sockaddr *)&sender_addr, addr_len);
+            }
+        }
+        // 4. Une passerelle reçoit un JACK -> Elle devient diffuseur pour l'expéditeur
         else if (strcmp(buffer, "JACK") == 0) {
-            add_to_tree(sender_ip);
+            pthread_mutex_lock(&lock);
+            strcpy(tree_neighbors[tree_neighbor_count++], sender_ip);
+            pthread_mutex_unlock(&lock);
         }
     }
 }
 
-// --- THREAD DE DONNÉES (DUPLICATION PORT 6000) ---
+// --- PLAN DE DONNÉES (DUPLICATION) ---
 void* data_thread(void* arg) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(DATA_PORT), .sin_addr.s_addr = INADDR_ANY };
@@ -144,32 +132,26 @@ void* data_thread(void* arg) {
 
     while (1) {
         int n = recv(sock, buffer, BUFFER_SIZE, 0);
-
         pthread_mutex_lock(&lock);
-        // Dupliquer vers les Microcore locaux
         for (int i = 0; i < receiver_count; i++) {
             inet_pton(AF_INET, local_receivers[i], &out_addr.sin_addr);
-            sendto(sock, buffer, n, 0, (struct sockaddr *)&out_addr, sizeof(out_addr));
+            sendto(sock, buffer, n, 0, (const struct sockaddr *)&out_addr, sizeof(out_addr));
         }
-        // Dupliquer vers les passerelles voisines dans l'arbre
-        for (int i = 0; i < tree_member_count; i++) {
-            inet_pton(AF_INET, tree_members[i], &out_addr.sin_addr);
-            sendto(sock, buffer, n, 0, (struct sockaddr *)&out_addr, sizeof(out_addr));
+        for (int i = 0; i < tree_neighbor_count; i++) {
+            inet_pton(AF_INET, tree_neighbors[i], &out_addr.sin_addr);
+            sendto(sock, buffer, n, 0, (const struct sockaddr *)&out_addr, sizeof(out_addr));
         }
         pthread_mutex_unlock(&lock);
     }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) { printf("Usage: %s <Mon_IP> <config.json>\n", argv[0]); return 1; }
+    if (argc < 3) return 1;
     strcpy(my_ip, argv[1]);
     load_config(argv[2]);
-
     pthread_t t1, t2;
     pthread_create(&t1, NULL, control_thread, NULL);
     pthread_create(&t2, NULL, data_thread, NULL);
-
     pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
     return 0;
 }
