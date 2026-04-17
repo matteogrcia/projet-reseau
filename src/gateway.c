@@ -6,145 +6,245 @@
 #include <pthread.h>
 #include <cjson/cJSON.h>
 
-#define CONTROL_PORT 5000
-#define DATA_PORT 6000
-#define BUFFER_SIZE 2048
-#define MAX_NODES 10
+/* --- PARAMÈTRES RÉSEAU --- */
+#define PORT_CONTROLE 5000
+#define PORT_DONNEES 6000
+#define TAILLE_TAMPON 2048
+#define NOMBRE_MAX_NOEUDS 20
 
+/* --- STRUCTURES DE DONNÉES --- */
 typedef struct {
-    char ip[16];
-    int cost_to_me; // Coût direct lu dans le JSON
-} NeighborConfig;
+    char adresse_ip[16];
+    int cout_direct;
+} VoisinPhysique;
 
-// État global
-char my_ip[16];
-char root_ip[16];
-int is_in_tree = 0; // 1 si je reçois déjà le flux
+/* --- ÉTAT DE LA PASSERELLE --- */
+char mon_ip[16];
+char ip_racine_pmr[16];
+int je_suis_la_racine = 0;
 
-NeighborConfig topology[MAX_NODES];
-int topology_count = 0;
+// Mesure de performance (Protégé par mutex car lu/écrit par les deux threads)
+int mon_cout_actuel_vers_racine = 999;
+char ip_de_mon_parent_actuel[16];
 
-// Listes de diffusion (Niveau 2)
-char tree_neighbors[MAX_NODES][16];
-int tree_neighbor_count = 0;
-char local_receivers[MAX_NODES][16];
-int receiver_count = 0;
+// Connaissance du réseau (issue du JSON)
+VoisinPhysique topologie_reseau[NOMBRE_MAX_NOEUDS];
+int nombre_voisins_physiques = 0;
 
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// Membres actifs de l'arbre multicast (ceux à qui je dois envoyer les données)
+char liste_voisins_multicast[NOMBRE_MAX_NOEUDS][16];
+int nombre_voisins_multicast = 0;
+// Note : Pour le JACK, on stocke aussi les coûts connus par la Racine
+int couts_voisins_multicast[NOMBRE_MAX_NOEUDS];
 
-// --- BLOC 1 : CHARGEMENT CONFIGURATION ---
-// Lit le JSON pour connaître les coûts directs (ex: C-A=6, C-B=2)
-void load_config(const char *filename) {
-    FILE *f = fopen(filename, "rb");
-    if (!f) exit(1);
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *data = malloc(len + 1);
-    fread(data, 1, len, f);
-    fclose(f);
+// Terminaux (Microcores) rattachés à moi
+char liste_terminaux_locaux[NOMBRE_MAX_NOEUDS][16];
+int nombre_terminaux_locaux = 0;
 
-    cJSON *json = cJSON_Parse(data);
-    strcpy(root_ip, cJSON_GetObjectItem(json, "root_gateway")->valuestring);
-    if (strcmp(my_ip, root_ip) == 0) is_in_tree = 1;
+pthread_mutex_t verrou_partage = PTHREAD_MUTEX_INITIALIZER;
 
-    cJSON *gateways = cJSON_GetObjectItem(json, "gateways");
-    int size = cJSON_GetArraySize(gateways);
-    for (int i = 0; i < size; i++) {
-        cJSON *item = cJSON_GetArrayItem(gateways, i);
-        const char* ip = cJSON_GetObjectItem(item, "ip")->valuestring;
-        if (strcmp(ip, my_ip) != 0) {
-            strcpy(topology[topology_count].ip, ip);
-            topology[topology_count].cost_to_me = cJSON_GetObjectItem(item, "cost")->valueint;
-            topology_count++;
+/******************************************************************************
+ * BLOC 1 : CHARGEMENT DE LA CARTE RÉSEAU (JSON)
+ *****************************************************************************/
+void charger_configuration(const char *nom_fichier) {
+    FILE *fichier = fopen(nom_fichier, "rb");
+    if (!fichier) { perror("Erreur ouverture JSON"); exit(1); }
+
+    fseek(fichier, 0, SEEK_END);
+    long longueur = ftell(fichier);
+    fseek(fichier, 0, SEEK_SET);
+    char *donnees_json = malloc(longueur + 1);
+    fread(donnees_json, 1, longueur, fichier);
+    fclose(fichier);
+
+    cJSON *objet_json = cJSON_Parse(donnees_json);
+    strcpy(ip_racine_pmr, cJSON_GetObjectItem(objet_json, "root_gateway")->valuestring);
+
+    if (strcmp(mon_ip, ip_racine_pmr) == 0) {
+        je_suis_la_racine = 1;
+        mon_cout_actuel_vers_racine = 0;
+    }
+
+    cJSON *passerelles = cJSON_GetObjectItem(objet_json, "gateways");
+    int taille_tableau = cJSON_GetArraySize(passerelles);
+    for (int i = 0; i < taille_tableau; i++) {
+        cJSON *item = cJSON_GetArrayItem(passerelles, i);
+        const char* ip_trouvee = cJSON_GetObjectItem(item, "ip")->valuestring;
+        if (strcmp(ip_trouvee, mon_ip) != 0) {
+            strcpy(topologie_reseau[nombre_voisins_physiques].adresse_ip, ip_trouvee);
+            topologie_reseau[nombre_voisins_physiques].cout_direct = cJSON_GetObjectItem(item, "cost")->valueint;
+            nombre_voisins_physiques++;
         }
     }
-    free(data);
-    cJSON_Delete(json);
+
+    strcpy(ip_de_mon_parent_actuel, ip_racine_pmr);
+    free(donnees_json);
+    cJSON_Delete(objet_json);
 }
 
-// --- BLOC 2 : PLAN DE CONTRÔLE (SIGNALISATION) ---
-void* control_thread(void* arg) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(CONTROL_PORT), .sin_addr.s_addr = INADDR_ANY };
-    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+/******************************************************************************
+ * BLOC 2 : PLAN DE CONTRÔLE (SIGNALISATION ET OPTIMISATION)
+ *****************************************************************************/
+void* thread_controle(void* arg) {
+    int descripteur_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in adresse_ecoute = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE), .sin_addr.s_addr = INADDR_ANY };
+    bind(descripteur_socket, (const struct sockaddr *)&adresse_ecoute, sizeof(adresse_ecoute));
 
-    char buffer[BUFFER_SIZE];
-    struct sockaddr_in sender_addr;
-    socklen_t addr_len = sizeof(sender_addr);
+    char message_recu[TAILLE_TAMPON];
+    struct sockaddr_in adresse_expediteur;
+    socklen_t taille_adresse = sizeof(adresse_expediteur);
 
     while (1) {
-        int n = recvfrom(sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&sender_addr, &addr_len);
-        buffer[n] = '\0';
-        char *sender_ip = inet_ntoa(sender_addr.sin_addr);
+        int octets_recus = recvfrom(descripteur_socket, message_recu, TAILLE_TAMPON, 0, (struct sockaddr *)&adresse_expediteur, &taille_adresse);
+        if (octets_recus < 0) continue;
+        message_recu[octets_recus] = '\0';
+        char *ip_expediteur = inet_ntoa(adresse_expediteur.sin_addr);
 
-        // A. Un terminal Microcore demande à rejoindre
-        if (strcmp(buffer, "JOIN") == 0) {
-            strcpy(local_receivers[receiver_count++], sender_ip);
-            // C demande aux autres : "Qui a déjà le flux ?"
-            for (int i = 0; i < topology_count; i++) {
-                struct sockaddr_in dest = { .sin_family = AF_INET, .sin_port = htons(CONTROL_PORT) };
-                inet_pton(AF_INET, topology[i].ip, &dest.sin_addr);
-                sendto(sock, "IN_TREE_QUERY", 13, 0, (struct sockaddr *)&dest, sizeof(dest));
+        /* 2.1 - GESTION DES INSCRIPTIONS (JOIN) */
+        if (strcmp(message_recu, "JOIN-T-PMI") == 0) {
+            pthread_mutex_lock(&verrou_partage);
+            strcpy(liste_terminaux_locaux[nombre_terminaux_locaux++], ip_expediteur);
+            pthread_mutex_unlock(&verrou_partage);
+
+            struct sockaddr_in dest_racine = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
+            inet_pton(AF_INET, ip_racine_pmr, &dest_racine.sin_addr);
+            sendto(descripteur_socket, "JOIN-PMI-PMR", 12, 0, (struct sockaddr *)&dest_racine, sizeof(dest_racine));
+        }
+        else if (strcmp(message_recu, "JOIN-PMI-PMR") == 0 && je_suis_la_racine) {
+            pthread_mutex_lock(&verrou_partage);
+            // On enregistre la PMI et on estime son coût à 1 (ou selon topologie si connue)
+            strcpy(liste_voisins_multicast[nombre_voisins_multicast], ip_expediteur);
+            couts_voisins_multicast[nombre_voisins_multicast] = 1;
+            nombre_voisins_multicast++;
+
+            // CONSTRUCTION DU JACK LISTE (Harmonisé avec le bloc 2.2)
+            char jack_annonce[TAILLE_TAMPON];
+            sprintf(jack_annonce, "JACK|");
+            // On ajoute la Racine elle-même dans la liste
+            sprintf(jack_annonce + strlen(jack_annonce), "%s,0;", mon_ip);
+            // On ajoute tous les membres actuels
+            for(int i=0; i < nombre_voisins_multicast; i++) {
+                sprintf(jack_annonce + strlen(jack_annonce), "%s,%d;",
+                        liste_voisins_multicast[i], couts_voisins_multicast[i]);
+            }
+            pthread_mutex_unlock(&verrou_partage);
+
+            // Envoi du JACK à tout le monde
+            for (int i = 0; i < nombre_voisins_multicast; i++) {
+                struct sockaddr_in client_arbre = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
+                inet_pton(AF_INET, liste_voisins_multicast[i], &client_arbre.sin_addr);
+                sendto(descripteur_socket, jack_annonce, strlen(jack_annonce), 0, (struct sockaddr *)&client_arbre, sizeof(client_arbre));
             }
         }
-        // B. On me demande si j'ai le flux
-        else if (strcmp(buffer, "IN_TREE_QUERY") == 0) {
-            if (is_in_tree) sendto(sock, "I_HAVE_FLOW", 11, 0, (struct sockaddr *)&sender_addr, addr_len);
+        else if (strcmp(message_recu, "JOIN-PMI-PMI") == 0) {
+            pthread_mutex_lock(&verrou_partage);
+            strcpy(liste_voisins_multicast[nombre_voisins_multicast++], ip_expediteur);
+            pthread_mutex_unlock(&verrou_partage);
         }
-        // C. C reçoit les réponses et choisit le voisin le MOINS CHER en coût DIRECT
-        else if (strcmp(buffer, "I_HAVE_FLOW") == 0) {
-            int current_neighbor_cost = 999;
-            for(int i=0; i<topology_count; i++) {
-                if(strcmp(topology[i].ip, sender_ip) == 0) current_neighbor_cost = topology[i].cost_to_me;
+
+        /* 2.2 - RECALCUL DYNAMIQUE LORS D'UN JACK (Optimisation 2 sens) */
+        else if (strncmp(message_recu, "JACK", 4) == 0) {
+            char copie_message[TAILLE_TAMPON];
+            strcpy(copie_message, message_recu + 5);
+
+            char *segment_noeud;
+            char *sauvegarde_ptr;
+            segment_noeud = strtok_r(copie_message, ";", &sauvegarde_ptr);
+
+            while (segment_noeud != NULL) {
+                char ip_potentielle[16];
+                int dist_racine_vers_potentiel;
+                sscanf(segment_noeud, "%[^,],%d", ip_potentielle, &dist_racine_vers_potentiel);
+
+                if (strcmp(ip_potentielle, mon_ip) != 0) {
+                    int cout_physique = 999;
+                    for(int i = 0; i < nombre_voisins_physiques; i++) {
+                        if(strcmp(topologie_reseau[i].adresse_ip, ip_potentielle) == 0) {
+                            cout_physique = topologie_reseau[i].cout_direct;
+                        }
+                    }
+
+                    pthread_mutex_lock(&verrou_partage);
+                    if ((dist_racine_vers_potentiel + cout_physique) < mon_cout_actuel_vers_racine) {
+                        char ancien_parent[16];
+                        strcpy(ancien_parent, ip_de_mon_parent_actuel);
+                        strcpy(ip_de_mon_parent_actuel, ip_potentielle);
+                        mon_cout_actuel_vers_racine = dist_racine_vers_potentiel + cout_physique;
+                        pthread_mutex_unlock(&verrou_partage);
+
+                        struct sockaddr_in adresse_controle = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
+                        inet_pton(AF_INET, ip_de_mon_parent_actuel, &adresse_controle.sin_addr);
+                        sendto(descripteur_socket, "JOIN-PMI-PMI", 12, 0, (struct sockaddr *)&adresse_controle, sizeof(adresse_controle));
+
+                        inet_pton(AF_INET, ancien_parent, &adresse_controle.sin_addr);
+                        sendto(descripteur_socket, "PRUNE-PMI-PMI", 13, 0, (struct sockaddr *)&adresse_controle, sizeof(adresse_controle));
+                    } else {
+                        pthread_mutex_unlock(&verrou_partage);
+                    }
+                }
+                segment_noeud = strtok_r(NULL, ";", &sauvegarde_ptr);
             }
-            // JACK : On envoie le join à celui qui est le plus proche physiquement parmi ceux qui ont le flux
-            // (Ici, C choisira B car coût 2 < coût 6 vers A)
-            sendto(sock, "JACK", 4, 0, (struct sockaddr *)&sender_addr, addr_len);
-            is_in_tree = 1;
         }
-        // D. Une passerelle accepte un nouveau voisin
-        else if (strcmp(buffer, "JACK") == 0) {
-            pthread_mutex_lock(&lock);
-            strcpy(tree_neighbors[tree_neighbor_count++], sender_ip);
-            pthread_mutex_unlock(&lock);
+
+        /* 2.3 - ÉLAGAGE (PRUNE) */
+        else if (strncmp(message_recu, "PRUNE", 5) == 0) {
+            pthread_mutex_lock(&verrou_partage);
+            for (int i = 0; i < nombre_voisins_multicast; i++) {
+                if (strcmp(liste_voisins_multicast[i], ip_expediteur) == 0) {
+                    strcpy(liste_voisins_multicast[i], liste_voisins_multicast[--nombre_voisins_multicast]);
+                    break;
+                }
+            }
+
+            if (nombre_voisins_multicast == 0 && nombre_terminaux_locaux == 0 && !je_suis_la_racine) {
+                struct sockaddr_in parent = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
+                inet_pton(AF_INET, ip_de_mon_parent_actuel, &parent.sin_addr);
+                sendto(descripteur_socket, "PRUNE-PMI-PMI", 13, 0, (struct sockaddr *)&parent, sizeof(parent));
+            }
+            pthread_mutex_unlock(&verrou_partage);
         }
     }
 }
 
-// --- BLOC 3 : PLAN DE DONNÉES (DUPLICATION L2) ---
-void* data_thread(void* arg) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(DATA_PORT), .sin_addr.s_addr = INADDR_ANY };
-    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+/******************************************************************************
+ * BLOC 3 : PLAN DE DONNÉES (DUPLICATION DU FLUX)
+ *****************************************************************************/
+void* thread_donnees(void* arg) {
+    int socket_donnees = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in adresse_flux = { .sin_family = AF_INET, .sin_port = htons(PORT_DONNEES), .sin_addr.s_addr = INADDR_ANY };
+    bind(socket_donnees, (struct sockaddr *)&adresse_flux, sizeof(adresse_flux));
 
-    char buffer[BUFFER_SIZE];
-    struct sockaddr_in out_addr = { .sin_family = AF_INET, .sin_port = htons(DATA_PORT) };
+    char tampon_donnees[TAILLE_TAMPON];
+    struct sockaddr_in destination_envoi = { .sin_family = AF_INET, .sin_port = htons(PORT_DONNEES) };
 
     while (1) {
-        int n = recv(sock, buffer, BUFFER_SIZE, 0);
-        pthread_mutex_lock(&lock);
-        // Vers Microcore locaux
-        for (int i = 0; i < receiver_count; i++) {
-            inet_pton(AF_INET, local_receivers[i], &out_addr.sin_addr);
-            sendto(sock, buffer, n, 0, (struct sockaddr *)&out_addr, sizeof(out_addr));
+        int taille_paquet = recv(socket_donnees, tampon_donnees, TAILLE_TAMPON, 0);
+        if (taille_paquet <= 0) continue;
+
+        pthread_mutex_lock(&verrou_partage);
+        for (int i = 0; i < nombre_terminaux_locaux; i++) {
+            inet_pton(AF_INET, liste_terminaux_locaux[i], &destination_envoi.sin_addr);
+            sendto(socket_donnees, tampon_donnees, taille_paquet, 0, (struct sockaddr *)&destination_envoi, sizeof(destination_envoi));
         }
-        // Vers autres VyOS (Voisins de l'arbre)
-        for (int i = 0; i < tree_neighbor_count; i++) {
-            inet_pton(AF_INET, tree_neighbors[i], &out_addr.sin_addr);
-            sendto(sock, buffer, n, 0, (struct sockaddr *)&out_addr, sizeof(out_addr));
+        for (int i = 0; i < nombre_voisins_multicast; i++) {
+            inet_pton(AF_INET, liste_voisins_multicast[i], &destination_envoi.sin_addr);
+            sendto(socket_donnees, tampon_donnees, taille_paquet, 0, (struct sockaddr *)&destination_envoi, sizeof(destination_envoi));
         }
-        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&verrou_partage);
     }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) return 1;
-    strcpy(my_ip, argv[1]);
-    load_config(argv[2]);
-    pthread_t t1, t2;
-    pthread_create(&t1, NULL, control_thread, NULL);
-    pthread_create(&t2, NULL, data_thread, NULL);
-    pthread_join(t1, NULL);
+    if (argc < 3) { printf("Usage: %s <Mon_IP_Locale> <config.json>\n", argv[0]); return 1; }
+    strcpy(mon_ip, argv[1]);
+    charger_configuration(argv[2]);
+
+    pthread_t fil_controle, fil_donnees;
+    pthread_create(&fil_controle, NULL, thread_controle, NULL);
+    pthread_create(&fil_donnees, NULL, thread_donnees, NULL);
+
+    printf("[SYSTEME] Passerelle lancée sur %s (%s)\n", mon_ip, je_suis_la_racine ? "PMR" : "PMI");
+    pthread_join(fil_controle, NULL);
+    pthread_join(fil_donnees, NULL);
     return 0;
 }
