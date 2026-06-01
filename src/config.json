@@ -1,8 +1,7 @@
 {
-  "root_gateway": "IP_VYOS_1",
+  "root_gateway": "10.0.0.1",
   "gateways": [
-    {"id": "P1", "ip": "IP_VYOS_1", "costs": {"P2": 2, "P3": 4}},
-    {"id": "P2", "ip": "IP_VYOS_2", "costs": {"P1": 2, "P3": 1}},
-    {"id": "P3", "ip": "IP_VYOS_3", "costs": {"P1": 4, "P2": 1}}
+    {"id": "PMR", "ip": "10.0.0.1", "cost": 0},
+    {"id": "P1",  "ip": "10.0.0.2", "cost": 1}
   ]
 }

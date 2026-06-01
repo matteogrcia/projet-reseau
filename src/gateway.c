@@ -67,7 +67,8 @@ void charger_configuration(const char *nom_fichier) {
         const char* ip = cJSON_GetObjectItem(item, "ip")->valuestring;
         if (strcmp(ip, mon_ip) != 0) {
             strcpy(topologie_reseau[nombre_voisins_physiques].adresse_ip, ip);
-            topologie_reseau[nombre_voisins_physiques].cout_direct = cJSON_GetObjectItem(item, "cost")->valueint;
+            cJSON *cost_item = cJSON_GetObjectItem(item, "cost");
+            topologie_reseau[nombre_voisins_physiques].cout_direct = cost_item ? cost_item->valueint : 1;
             nombre_voisins_physiques++;
         }
     }
@@ -248,7 +249,7 @@ int main(int argc, char *argv[]) {
     pthread_t c, d, s;
     pthread_create(&c, NULL, thread_controle, NULL);
     pthread_create(&d, NULL, thread_donnees, NULL);
-    if (je_suis_la_racine) pthread_create(&s, NULL, thread_source_flux, NULL);
+//    if (je_suis_la_racine) pthread_create(&s, NULL, thread_source_flux, NULL);
     printf("[SYSTEM] %s ON %s\n", je_suis_la_racine ? "PMR" : "PMI", mon_ip);
     pthread_join(c, NULL); pthread_join(d, NULL);
     return 0;
