@@ -70,6 +70,17 @@ void charger_configuration(const char *nom_fichier) {
         }
     }
     strcpy(ip_de_mon_parent_actuel, ip_racine_pmr);
+
+    // CORRECTION PHYSIQUE : Si je ne suis pas la racine, je cherche mon coût physique direct vers la racine PMR
+    if (!je_suis_la_racine) {
+        for (int i = 0; i < nombre_voisins_physiques; i++) {
+            if (strcmp(topologie_reseau[i].adresse_ip, ip_racine_pmr) == 0) {
+                mon_cout_actuel_vers_racine = topologie_reseau[i].cout_direct;
+                break;
+            }
+        }
+    }
+
     free(donnees_json);
     cJSON_Delete(objet_json);
 }
@@ -114,8 +125,6 @@ void* thread_controle(void* arg) {
         /* 3.1 - JOINS */
         if (strcmp(buf, "JOIN-T-PMI") == 0) {
             pthread_mutex_lock(&verrou_partage);
-
-            // MODIFICATION : Empêcher l'inscription multiple d'un même terminal local
             int deja_present = 0;
             for (int i = 0; i < nombre_terminaux_locaux; i++) {
                 if (strcmp(liste_terminaux_locaux[i], ip_exp) == 0) {
@@ -136,18 +145,28 @@ void* thread_controle(void* arg) {
         else if (strcmp(buf, "JOIN-PMI-PMR") == 0 && je_suis_la_racine) {
             pthread_mutex_lock(&verrou_partage);
 
-            // MODIFICATION : Empêcher l'inscription multiple d'une PMI sur la racine
             int deja_present = 0;
+            int index_voisin = -1;
             for (int i = 0; i < nombre_voisins_multicast; i++) {
                 if (strcmp(liste_voisins_multicast[i], ip_exp) == 0) {
                     deja_present = 1;
+                    index_voisin = i;
                     break;
                 }
             }
             if (!deja_present) {
                 strcpy(liste_voisins_multicast[nombre_voisins_multicast], ip_exp);
-                couts_voisins_multicast[nombre_voisins_multicast++] = 1;
-                printf("[JOIN-PMR] Passerelle enfant ajoutée : %s\n", ip_exp);
+
+                // CORRECTION PHYSIQUE : Chercher le vrai coût physique depuis la topologie chargée
+                int cout_physique_associe = 1; // Valeur de secours si non trouvé
+                for (int j = 0; j < nombre_voisins_physiques; j++) {
+                    if (strcmp(topologie_reseau[j].adresse_ip, ip_exp) == 0) {
+                        cout_physique_associe = topologie_reseau[j].cout_direct;
+                        break;
+                    }
+                }
+                couts_voisins_multicast[nombre_voisins_multicast++] = cout_physique_associe;
+                printf("[JOIN-PMR] Passerelle enfant ajoutée : %s avec coût physique : %d\n", ip_exp, cout_physique_associe);
             }
 
             char jack[TAILLE_TAMPON];
@@ -164,8 +183,6 @@ void* thread_controle(void* arg) {
         }
         else if (strcmp(buf, "JOIN-PMI-PMI") == 0) {
             pthread_mutex_lock(&verrou_partage);
-
-            // MODIFICATION : Empêcher l'inscription multiple entre PMI intermédiaires
             int deja_present = 0;
             for (int i = 0; i < nombre_voisins_multicast; i++) {
                 if (strcmp(liste_voisins_multicast[i], ip_exp) == 0) {
@@ -194,6 +211,7 @@ void* thread_controle(void* arg) {
                     int c_p = 999;
                     for(int i=0; i<nombre_voisins_physiques; i++)
                         if(strcmp(topologie_reseau[i].adresse_ip, ip_p) == 0) c_p = topologie_reseau[i].cout_direct;
+
                     pthread_mutex_lock(&verrou_partage);
                     if ((d_r + c_p) < mon_cout_actuel_vers_racine) {
                         char old[16];
@@ -201,6 +219,9 @@ void* thread_controle(void* arg) {
                         strcpy(ip_de_mon_parent_actuel, ip_p);
                         mon_cout_actuel_vers_racine = d_r + c_p;
                         pthread_mutex_unlock(&verrou_partage);
+
+                        printf("[ALGO-JACK] Raccourci physique détecté via %s ! (Nouveau coût cumulé: %d)\n", ip_p, mon_cout_actuel_vers_racine);
+
                         struct sockaddr_in dest = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
                         inet_pton(AF_INET, ip_de_mon_parent_actuel, &dest.sin_addr);
                         sendto(ds, "JOIN-PMI-PMI", 12, 0, (struct sockaddr *)&dest, sizeof(dest));
@@ -217,31 +238,25 @@ void* thread_controle(void* arg) {
         /* 3.3 - DÉSENREGISTREMENT (PRUNE) */
         else if (strncmp(buf, "PRUNE", 5) == 0) {
             pthread_mutex_lock(&verrou_partage);
-
-            // 1. Un terminal s'en va
             if (strcmp(buf, "PRUNE-T-PMI") == 0 || strcmp(buf, "PRUNE-T-PMR") == 0) {
-                // MODIFICATION : Nettoyer TOUTES les occurrences d'un terminal (pas de break prématuré)
                 for (int i = 0; i < nombre_terminaux_locaux; i++) {
                     if (strcmp(liste_terminaux_locaux[i], ip_exp) == 0) {
                         strcpy(liste_terminaux_locaux[i], liste_terminaux_locaux[--nombre_terminaux_locaux]);
-                        i--; // On décrémente pour réévaluer cette case (au cas où un doublon s'y trouve)
+                        i--;
                     }
                 }
                 printf("[PRUNE] Nettoyage terminal %s fini (Restants: %d)\n", ip_exp, nombre_terminaux_locaux);
             }
-            // 2. Une passerelle enfant s'en va
             else if (strcmp(buf, "PRUNE-PMI-PMI") == 0 || strcmp(buf, "PRUNE-PMI-PMR") == 0) {
-                // MODIFICATION : Nettoyer TOUTES les occurrences d'une passerelle (pas de break prématuré)
                 for (int i = 0; i < nombre_voisins_multicast; i++) {
                     if (strcmp(liste_voisins_multicast[i], ip_exp) == 0) {
                         strcpy(liste_voisins_multicast[i], liste_voisins_multicast[--nombre_voisins_multicast]);
-                        i--; // On décrémente pour valider l'élément permuté
+                        i--;
                     }
                 }
                 printf("[PRUNE] Nettoyage passerelle %s fini (Restantes: %d)\n", ip_exp, nombre_voisins_multicast);
             }
 
-            // 3. Auto-élagage si plus d'utilité
             if (nombre_voisins_multicast == 0 && nombre_terminaux_locaux == 0 && !je_suis_la_racine) {
                 struct sockaddr_in p = { .sin_family = AF_INET, .sin_port = htons(PORT_CONTROLE) };
                 inet_pton(AF_INET, ip_de_mon_parent_actuel, &p.sin_addr);
@@ -281,13 +296,11 @@ void* thread_donnees(void* arg) {
             continue;
         }
 
-        // Duplication vers les terminaux locaux
         for (int i = 0; i < nombre_terminaux_locaux; i++) {
             inet_pton(AF_INET, liste_terminaux_locaux[i], &d.sin_addr);
             sendto(sd, t, sz, 0, (struct sockaddr *)&d, sizeof(d));
         }
 
-        // Duplication vers les voisins de l'arbre
         for (int i = 0; i < nombre_voisins_multicast; i++) {
             if (strcmp(liste_voisins_multicast[i], ip_source_paquet) != 0) {
                 inet_pton(AF_INET, liste_voisins_multicast[i], &d.sin_addr);
@@ -306,8 +319,7 @@ int main(int argc, char *argv[]) {
     pthread_create(&c, NULL, thread_controle, NULL);
     pthread_create(&d, NULL, thread_donnees, NULL);
 
-    // Décommenté pour tes tests si tu veux que la racine gère sa propre source C interne
-    if (je_suis_la_racine) pthread_create(&s, NULL, thread_source_flux, NULL);
+    //if (je_suis_la_racine) pthread_create(&s, NULL, thread_source_flux, NULL);
 
     printf("[SYSTEM] %s ON %s\n", je_suis_la_racine ? "PMR" : "PMI", mon_ip);
     pthread_join(c, NULL); pthread_join(d, NULL);
